@@ -514,111 +514,509 @@ ICHARG = 1            # Read CHGCAR from relaxation
 
 ---
 
-## Step 8: Finite-Size Corrections
+## Step 8: Finite-Size Corrections（所有statics完成后）
 
-### Freysoldt (FNV) Correction
+**前置条件：** `Bulk/statics/` 和所有 `Defect/*/q*/statics/` 已收敛。
 
-For **each charged defect** (q ≠ 0):
+### fnv_correction.py — FNV 修正计算脚本
 
-**Required inputs:**
-- Bulk LOCPOT (from host static)
-- Defect LOCPOT (from defect static)
-- Dielectric constant ε (scalar for cubic systems)
-- Charge state q
-- Supercell lattice vectors
+```python
+#!/usr/bin/env python3
+"""
+Freysoldt (FNV) correction for charged defects.
+Usage: python fnv_correction.py <bulk_locpot> <defect_locpot> <charge> <epsilon> [--madelung <alpha>]
+Output: correction value in eV, writes detailed log
+"""
+import numpy as np
+import sys
+import os
+import argparse
 
-**The correction consists of:**
-1. **Electrostatic (Madelung) energy:** Energy of a point charge q in a periodic box screened by ε
-   ```
-   E_Madelung = α_M × q² / (2 × ε × L)
-   ```
-   where α_M is the Madelung constant for the supercell geometry and L is the characteristic length.
+def read_locpot(filepath):
+    """读取VASP LOCPOT文件，返回晶格向量和3D势场数据"""
+    with open(filepath) as f:
+        f.readline()  # comment
+        scale = float(f.readline())
+        lattice = np.array([[float(x) for x in f.readline().split()] for _ in range(3)]) * scale
+        species = f.readline().split()
+        counts = [int(x) for x in f.readline().split()]
+        total_atoms = sum(counts)
+        # Skip coordinate type line and atom coordinates
+        f.readline()  # Direct/Cartesian
+        for _ in range(total_atoms):
+            f.readline()
+        f.readline()  # blank line
+        # Read grid dimensions
+        nx, ny, nz = [int(x) for x in f.readline().split()]
+        # Read potential data
+        data = []
+        while len(data) < nx * ny * nz:
+            line = f.readline()
+            if line.strip():
+                data.extend([float(x) for x in line.split()])
+        pot = np.array(data).reshape((nz, ny, nx)).transpose((2, 1, 0))  # [nx,ny,nz]
+    return lattice, pot, (nx, ny, nz)
 
-2. **Potential alignment ΔV:** From comparing planar-averaged potentials of bulk and defect LOCPOT along each axis. Far from the defect, the difference should plateau → that plateau value is ΔV.
+def planar_average(pot, axis):
+    """沿指定轴计算平面平均势"""
+    axes = [0, 1, 2]
+    axes.remove(axis)
+    return np.mean(pot, axis=tuple(axes))
 
-3. **Total correction:**
-   ```
-   E_corr = E_Madelung + q × ΔV
-   ```
+def compute_madelung_energy(alpha_M, q, epsilon, L):
+    """计算 Madelung 能量 (eV)
+    E_Mad = alpha_M * q^2 / (2 * epsilon * L)
+    L in Angstrom, result in eV (with conversion factor)
+    """
+    # Hartree atomic units: 1 Ha = 27.2114 eV, 1 Bohr = 0.529177 Å
+    L_bohr = L / 0.529177
+    E_hartree = alpha_M * q**2 / (2.0 * epsilon * L_bohr)
+    return E_hartree * 27.2114
 
-**Log for EACH charged defect:**
+def compute_potential_alignment(bulk_pot, defect_pot, lattice, axis, q, epsilon):
+    """计算沿某轴的势能对齐量 ΔV"""
+    V_bulk = planar_average(bulk_pot, axis)
+    V_defect = planar_average(defect_pot, axis)
+    diff = V_defect - V_bulk
+
+    n = len(diff)
+    # 取远离缺陷的区域（两端各1/4）作为对齐参考
+    far_region = np.concatenate([diff[:n//4], diff[3*n//4:]])
+    delta_V = np.mean(far_region)
+    return delta_V
+
+def main():
+    parser = argparse.ArgumentParser(description='FNV correction for charged defects')
+    parser.add_argument('bulk_locpot', help='Path to bulk LOCPOT')
+    parser.add_argument('defect_locpot', help='Path to defect LOCPOT')
+    parser.add_argument('charge', type=int, help='Charge state q')
+    parser.add_argument('epsilon', type=float, help='Dielectric constant')
+    parser.add_argument('--madelung', type=float, default=2.8373,
+                        help='Madelung constant (default: 2.8373 for SC)')
+    parser.add_argument('--output', default=None, help='Output log file')
+    args = parser.parse_args()
+
+    q = args.charge
+    if q == 0:
+        print("q=0: No correction needed")
+        print("CORRECTION: 0.000")
+        return
+
+    print(f"Reading bulk LOCPOT: {args.bulk_locpot}")
+    lattice_b, pot_b, grid_b = read_locpot(args.bulk_locpot)
+    print(f"Reading defect LOCPOT: {args.defect_locpot}")
+    lattice_d, pot_d, grid_d = read_locpot(args.defect_locpot)
+
+    # 超胞特征长度（取晶格向量长度的平均值）
+    L_values = [np.linalg.norm(lattice_b[i]) for i in range(3)]
+    L_avg = np.mean(L_values)
+
+    # Madelung energy
+    E_mad = compute_madelung_energy(args.madelung, q, args.epsilon, L_avg)
+
+    # Potential alignment（三个轴取平均）
+    delta_Vs = []
+    for axis in range(3):
+        dV = compute_potential_alignment(pot_b, pot_d, lattice_b, axis, q, args.epsilon)
+        delta_Vs.append(dV)
+    delta_V = np.mean(delta_Vs)
+
+    # Total correction
+    E_align = q * delta_V
+    E_corr = E_mad + E_align
+
+    # Output
+    result = f"""FNV Correction Result:
+  Charge state: q = {q}
+  Dielectric constant: epsilon = {args.epsilon}
+  Madelung constant: alpha = {args.madelung}
+  Supercell lengths: {L_values[0]:.3f}, {L_values[1]:.3f}, {L_values[2]:.3f} Å
+  Average length: {L_avg:.3f} Å
+  ---
+  Madelung energy: {E_mad:.4f} eV
+  Potential alignment (per axis): {delta_Vs[0]:.4f}, {delta_Vs[1]:.4f}, {delta_Vs[2]:.4f} eV
+  Average ΔV: {delta_V:.4f} eV
+  Alignment correction (q×ΔV): {E_align:.4f} eV
+  ---
+  Total FNV correction: {E_corr:.4f} eV
+CORRECTION: {E_corr:.4f}"""
+
+    print(result)
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(result + '\n')
+
+if __name__ == '__main__':
+    main()
 ```
-Defect: V_Cd q=-2
-  Madelung energy: X.XXX eV
-  Potential alignment: X.XXX eV
-  Total FNV correction: X.XXX eV
-  Uncorrected formation energy: X.XXX eV
-  Corrected formation energy: X.XXX eV
-```
 
-### Madelung Constant Calculation
+### 使用方法
 
-The Madelung constant for the supercell can be computed via a separate VASP calculation:
-- Place a single test charge (NELECT=2) in the supercell
-- Use NELM=1, IDIPOL=4, ALGO=Fast
-- Extract the Madelung energy from the output
-
-**INCAR for Madelung:**
-```
-NELM = 1
-EDIFF = 1E-5
-ISMEAR = 0
-SIGMA = 0.05
-GGA = PE
-PREC = Accurate
-ISPIN = 2
-ENCUT = <same>
-NPAR = 8
-ICORELEVEL = 1
-LVHAR = .TRUE.
-ICHARG = 1
-NELECT = 2
-IDIPOL = 4
-ALGO = Fast
+```bash
+# 对每个带电缺陷运行
+python fnv_correction.py \
+    Bulk/statics/LOCPOT \
+    Defect/Intrinsic/V_Cd/q-2/statics/LOCPOT \
+    -2 \
+    10.3 \
+    --madelung 2.8373 \
+    --output Defect/Intrinsic/V_Cd/q-2/fnv_correction.log
 ```
 
 ---
 
 ## Step 9: Formation Energy & Diagram
 
-### Formation Energy Formula
+### formation_energy.py — 形成能计算与绘图脚本
 
+```python
+#!/usr/bin/env python3
+"""
+Formation energy calculation and diagram plotting.
+Reads VASP results, applies corrections, plots E_f vs E_Fermi.
+
+Usage:
+  python formation_energy.py --config formation_config.yaml
+  python formation_energy.py --workdir . --epsilon 10.3 --band_gap 1.5
+
+Config file (formation_config.yaml):
+  bulk_static: Bulk/statics
+  epsilon: 10.3
+  madelung: 2.8373
+  band_gap: 1.5
+  E_pure:
+    Cd: -1.7736
+    Te: -4.6974
+  chemical_potential_limits:
+    Cd-rich:
+      Cd: 0.0
+      Te: -1.1854
+    Te-rich:
+      Cd: -1.1854
+      Te: 0.0
+  defects:
+    - name: V_Cd
+      path: Defect/Intrinsic/V_Cd
+      removed: {Cd: 1}
+      added: {}
+    - name: V_Te
+      path: Defect/Intrinsic/V_Te
+      removed: {Te: 1}
+      added: {}
+    - name: Te_Cd
+      path: Defect/Intrinsic/Te_Cd
+      removed: {Cd: 1}
+      added: {Te: 1}
+    - name: Cl_Te
+      path: Defect/Impurity/Cl_Te
+      removed: {Te: 1}
+      added: {Cl: 1}
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import sys
+import yaml
+import subprocess
+import re
+from datetime import datetime
+
+def get_energy_from_outcar(outcar_path):
+    """从OUTCAR提取 'energy without entropy' (sigma->0)"""
+    E = None
+    with open(outcar_path) as f:
+        for line in f:
+            if "energy  without entropy" in line:
+                E = float(line.split()[-1])
+    return E
+
+def get_vbm_from_eigenval(eigenval_path):
+    """从EIGENVAL提取VBM（最高占据态能量）"""
+    with open(eigenval_path) as f:
+        lines = f.readlines()
+    # Header: line 6 has NELECT, NKPTS, NBANDS
+    header = lines[5].split()
+    nelect = int(header[0])
+    nkpts = int(header[1])
+    nbands = int(header[2])
+
+    vbm = -999.0
+    idx = 7  # skip header lines
+    for k in range(nkpts):
+        idx += 1  # blank line
+        idx += 1  # k-point header
+        for b in range(nbands):
+            parts = lines[idx].split()
+            band_idx = int(parts[0])
+            e_up = float(parts[1])
+            occ_up = float(parts[2])
+            if len(parts) > 3:  # ISPIN=2
+                e_down = float(parts[3])
+                occ_down = float(parts[4])
+                if occ_up > 0.5:
+                    vbm = max(vbm, e_up)
+                if occ_down > 0.5:
+                    vbm = max(vbm, e_down)
+            else:
+                if occ_up > 0.5:
+                    vbm = max(vbm, e_up)
+            idx += 1
+    return vbm
+
+def get_nelect_from_outcar(outcar_path):
+    """从OUTCAR提取NELECT"""
+    with open(outcar_path) as f:
+        for line in f:
+            if "NELECT" in line:
+                return int(float(line.split()[2]))
+    return None
+
+def compute_fnv_correction(bulk_locpot, defect_locpot, charge, epsilon, madelung=2.8373):
+    """调用fnv_correction.py并返回修正值"""
+    if charge == 0:
+        return 0.0
+    script = os.path.join(os.path.dirname(__file__), 'fnv_correction.py')
+    try:
+        result = subprocess.run(
+            ['python3', script, bulk_locpot, defect_locpot, str(charge), str(epsilon),
+             '--madelung', str(madelung)],
+            capture_output=True, text=True, timeout=300
+        )
+        for line in result.stdout.split('\n'):
+            if line.startswith('CORRECTION:'):
+                return float(line.split(':')[1].strip())
+    except Exception as e:
+        print(f"  WARNING: FNV correction failed: {e}")
+    return 0.0
+
+def find_charge_dirs(defect_path):
+    """查找缺陷目录下的所有电荷态目录"""
+    charges = []
+    for d in sorted(os.listdir(defect_path)):
+        if d.startswith('q') and os.path.isdir(os.path.join(defect_path, d)):
+            q_str = d[1:]  # remove 'q'
+            try:
+                q = int(q_str.replace('+', ''))
+                charges.append((q, os.path.join(defect_path, d)))
+            except ValueError:
+                pass
+    return charges
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Formation energy calculation and plotting')
+    parser.add_argument('--config', required=True, help='YAML config file')
+    parser.add_argument('--output', default='FormationEnergy', help='Output directory')
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    os.makedirs(args.output, exist_ok=True)
+    log_path = os.path.join(args.output, 'formation_energy.log')
+    log_lines = []
+    def log(msg):
+        log_lines.append(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+        print(msg)
+
+    # ---- 读取 bulk 能量和 VBM ----
+    bulk_dir = cfg['bulk_static']
+    E_bulk = get_energy_from_outcar(os.path.join(bulk_dir, 'OUTCAR'))
+    E_VBM = get_vbm_from_eigenval(os.path.join(bulk_dir, 'EIGENVAL'))
+    nelect_bulk = get_nelect_from_outcar(os.path.join(bulk_dir, 'OUTCAR'))
+    band_gap = cfg['band_gap']
+    epsilon = cfg['epsilon']
+    madelung = cfg.get('madelung', 2.8373)
+
+    log(f"Bulk energy: {E_bulk:.6f} eV")
+    log(f"VBM: {E_VBM:.4f} eV")
+    log(f"Band gap: {band_gap} eV")
+    log(f"Dielectric constant: {epsilon}")
+
+    E_pure = cfg['E_pure']         # {element: E_per_atom}
+    limits = cfg['chemical_potential_limits']  # {limit_name: {element: delta_mu}}
+
+    # ---- 计算各缺陷的形成能 ----
+    all_results = {}  # {defect_name: {q: {limit: E_f_at_VBM}}}
+
+    for defect_cfg in cfg['defects']:
+        name = defect_cfg['name']
+        dpath = defect_cfg['path']
+        removed = defect_cfg.get('removed', {})
+        added = defect_cfg.get('added', {})
+
+        log(f"\n--- Defect: {name} ---")
+        all_results[name] = {}
+
+        charge_dirs = find_charge_dirs(dpath)
+        for q, q_dir in charge_dirs:
+            statics_dir = os.path.join(q_dir, 'statics')
+            outcar = os.path.join(statics_dir, 'OUTCAR')
+            if not os.path.exists(outcar):
+                log(f"  q={q}: OUTCAR not found, skipping")
+                continue
+
+            E_defect = get_energy_from_outcar(outcar)
+            log(f"  q={q}: E_defect = {E_defect:.6f} eV")
+
+            # FNV correction
+            E_corr = 0.0
+            if q != 0:
+                bulk_locpot = os.path.join(bulk_dir, 'LOCPOT')
+                defect_locpot = os.path.join(statics_dir, 'LOCPOT')
+                if os.path.exists(bulk_locpot) and os.path.exists(defect_locpot):
+                    E_corr = compute_fnv_correction(
+                        bulk_locpot, defect_locpot, q, epsilon, madelung)
+                    log(f"  q={q}: FNV correction = {E_corr:.4f} eV")
+                else:
+                    log(f"  q={q}: WARNING - LOCPOT not found, correction=0")
+
+            # 对各化学势条件计算形成能
+            all_results[name][q] = {}
+            for limit_name, delta_mus in limits.items():
+                # 化学势项: Σ n_i × μ_i
+                chem_term = 0.0
+                for elem, n in removed.items():
+                    mu_i = E_pure[elem] + delta_mus[elem]
+                    chem_term += n * mu_i
+                for elem, n in added.items():
+                    mu_i = E_pure[elem] + delta_mus.get(elem, 0.0)
+                    chem_term -= n * mu_i
+
+                # E_f at VBM (E_Fermi=0)
+                E_f_vbm = E_defect - E_bulk + chem_term + q * E_VBM + E_corr
+                all_results[name][q][limit_name] = E_f_vbm
+                log(f"  q={q}, {limit_name}: E_f(VBM) = {E_f_vbm:.4f} eV")
+
+    # ---- 计算转变能级 ----
+    log(f"\n=== Transition Levels ===")
+    for name, q_data in all_results.items():
+        charges = sorted(q_data.keys())
+        for i in range(len(charges)):
+            for j in range(i+1, len(charges)):
+                q1, q2 = charges[i], charges[j]
+                for limit_name in limits:
+                    if limit_name in q_data[q1] and limit_name in q_data[q2]:
+                        E1 = q_data[q1][limit_name]
+                        E2 = q_data[q2][limit_name]
+                        if q2 != q1:
+                            E_F_trans = (E1 - E2) / (q2 - q1)
+                            if 0 <= E_F_trans <= band_gap:
+                                log(f"  {name}: ε({q1}/{q2}) = {E_F_trans:.4f} eV  [{limit_name}]")
+
+    # ---- 绘图 ----
+    for limit_name in limits:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        E_F = np.linspace(0, band_gap, 500)
+        colors = plt.cm.tab10(np.linspace(0, 1, len(all_results)))
+
+        for (name, q_data), color in zip(all_results.items(), colors):
+            lines = []
+            for q, limit_data in sorted(q_data.items()):
+                if limit_name in limit_data:
+                    E_f_vbm = limit_data[limit_name]
+                    E_f_line = E_f_vbm + q * E_F
+                    lines.append(E_f_line)
+                    # Faded individual lines
+                    ax.plot(E_F, E_f_line, color=color, lw=0.7, alpha=0.25, ls='--')
+
+            if lines:
+                lower_envelope = np.min(np.array(lines), axis=0)
+                ax.plot(E_F, lower_envelope, color=color, lw=2.5, label=name)
+
+        # Band edges
+        ax.axvspan(-0.5, 0, alpha=0.12, color='cornflowerblue')
+        ax.axvspan(band_gap, band_gap + 0.5, alpha=0.12, color='orange')
+        ax.axhline(0, color='k', ls='--', alpha=0.3, lw=0.8)
+
+        ax.set_xlim(-0.2, band_gap + 0.2)
+        y_min = min(0, min(env.min() for env in [np.min(np.array(
+            [ld[limit_name] + q * E_F for q, ld in qd.items() if limit_name in ld]),
+            axis=0) for qd in all_results.values() if qd]) - 0.5)
+        ax.set_ylim(y_min, None)
+        ax.set_xlabel("Fermi Level (eV)", fontsize=14)
+        ax.set_ylabel("Formation Energy (eV)", fontsize=14)
+        ax.set_title(f"Formation Energy Diagram ({limit_name})", fontsize=14)
+        ax.legend(fontsize=11, loc='best')
+        plt.tight_layout()
+
+        fig_path = os.path.join(args.output, f'formation_energy_{limit_name}.pdf')
+        fig.savefig(fig_path, dpi=300)
+        fig_path_png = os.path.join(args.output, f'formation_energy_{limit_name}.png')
+        fig.savefig(fig_path_png, dpi=150)
+        plt.close(fig)
+        log(f"\nPlot saved: {fig_path}")
+
+    # ---- 保存日志 ----
+    with open(log_path, 'w') as f:
+        f.write('\n'.join(log_lines) + '\n')
+    log(f"Log saved: {log_path}")
+
+if __name__ == '__main__':
+    main()
 ```
-E_f[X^q] = E_tot[X^q] - E_tot[bulk] + Σ(n_i × μ_i) + q × (E_VBM + E_Fermi) + E_corr
+
+### formation_config.yaml 配置文件模板
+
+```yaml
+# 形成能计算配置
+bulk_static: Bulk/statics
+epsilon: 10.3                    # 介电常数
+madelung: 2.8373                 # Madelung常数 (SC lattice)
+band_gap: 1.5                    # 带隙 (eV)
+
+# 各元素的单质能量 (eV/atom)
+E_pure:
+  Cd: -1.7736
+  Te: -4.6974
+
+# 化学势极限条件 (Δμ, eV)
+chemical_potential_limits:
+  Cd-rich:
+    Cd: 0.0
+    Te: -1.1854
+  Te-rich:
+    Cd: -1.1854
+    Te: 0.0
+
+# 缺陷列表
+defects:
+  - name: V_Cd
+    path: Defect/Intrinsic/V_Cd
+    removed: {Cd: 1}
+    added: {}
+  - name: V_Te
+    path: Defect/Intrinsic/V_Te
+    removed: {Te: 1}
+    added: {}
+  - name: Te_Cd
+    path: Defect/Intrinsic/Te_Cd
+    removed: {Cd: 1}
+    added: {Te: 1}
+  - name: Cd_Te
+    path: Defect/Intrinsic/Cd_Te
+    removed: {Te: 1}
+    added: {Cd: 1}
+  - name: Cl_Te
+    path: Defect/Impurity/Cl_Te
+    removed: {Te: 1}
+    added: {Cl: 1}
 ```
 
-**Terms from VASP:**
-- `E_tot[X^q]` = total energy from defect static calculation (sigma→0)
-- `E_tot[bulk]` = total energy from host static calculation
-- `n_i` = number of atoms removed (+) or added (-) of species i
-- `μ_i` = chemical potential (from stability region analysis)
-- `E_VBM` = VBM eigenvalue from host calculation
-- `q` = charge state
-- `E_corr` = FNV or Kumagai correction
+### 使用方法
 
-### Chemical Potential Limits
+```bash
+# 1. 编辑 formation_config.yaml（填入实际参数）
+# 2. 运行
+python formation_energy.py --config formation_config.yaml --output FormationEnergy/
 
-For binary AB compound:
-```
-μ_A + μ_B = E_bulk_per_formula
-ΔH_f = E_AB - E_A(elemental) - E_B(elemental)
+# 输出:
+#   FormationEnergy/formation_energy_Cd-rich.pdf
+#   FormationEnergy/formation_energy_Te-rich.pdf
+#   FormationEnergy/formation_energy.log
 ```
 
-**p1 (A-rich):** Δμ_A = 0, Δμ_B = ΔH_f
-**p2 (B-rich):** Δμ_B = 0, Δμ_A = ΔH_f
-
-Example from dasp.in:
-```
-E_pure = -1.7736 -4.6974      # E/atom for Cd, Te elemental phases
-p1 = 0.0 -1.1854              # Cd-rich: Δμ_Cd=0, Δμ_Te=-1.1854
-p2 = -1.1854 0.0              # Te-rich: Δμ_Cd=-1.1854, Δμ_Te=0
-```
-
-### Plotting
-
-The formation energy diagram shows E_f vs E_Fermi (from 0=VBM to E_gap=CBM). Each charge state is a line with slope q. Plot the **lower envelope** (stable charge states only) for each defect.
-
-**Log:** Record ALL formation energies, transition levels, and the final plot file path.
+**Log:** 脚本自动记录所有形成能、转变能级到 `FormationEnergy/formation_energy.log`。
 
 ---
 
@@ -1281,12 +1679,32 @@ phase4_check_completion() {
     done
 
     $any_static_exists || return 1
-    if $all_done; then
-        log_msg "===== ALL PHASES COMPLETE ====="
-        log_msg "所有static计算已收敛，可以进行有限尺寸修正和形成能计算"
-        return 0
+    $all_done || return 1
+
+    # 检查是否已经运行过形成能计算
+    [ -f "$WORKDIR/FormationEnergy/formation_energy.log" ] && return 0
+
+    log_msg "Phase4→5: All statics CONVERGED, 开始FNV修正和形成能计算..."
+
+    # 检查 formation_config.yaml 是否存在
+    if [ ! -f "$WORKDIR/formation_config.yaml" ]; then
+        log_msg "WARNING: formation_config.yaml 不存在，请创建后手动运行 formation_energy.py"
+        log_msg "===== STATICS COMPLETE, 等待 formation_config.yaml ====="
+        return 1
     fi
-    return 1
+
+    # 运行形成能计算（自动包含FNV修正）
+    cd "$WORKDIR"
+    python3 formation_energy.py --config formation_config.yaml --output FormationEnergy/ 2>&1 | tee -a $LOG
+
+    if [ -f "$WORKDIR/FormationEnergy/formation_energy.log" ]; then
+        log_msg "===== ALL PHASES COMPLETE ====="
+        log_msg "形成能计算完成，结果在 FormationEnergy/ 目录"
+        return 0
+    else
+        log_msg "ERROR: 形成能计算失败，请检查"
+        return 1
+    fi
 }
 
 # ============ 状态报告 ============
