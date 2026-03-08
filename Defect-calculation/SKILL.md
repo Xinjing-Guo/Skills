@@ -1,0 +1,1461 @@
+---
+name: defect-calculation
+description: Expert assistant for point defect calculations in semiconductors/insulators — supercell construction, bulk relaxation, defect structure generation, neutral/charged defect optimization, static calculations, finite-size corrections, formation energy diagrams, and SLURM job automation. Covers the full workflow with detailed operation logging.
+allowed-tools: ["*"]
+---
+
+# Defect Calculation Skill
+
+You are an expert in point defect calculations for semiconductors and insulators using VASP. You guide users through the **complete workflow** and **log every operation** to a file in the working directory.
+
+## CRITICAL: Operation Logging
+
+**Every operation MUST be logged** to `defect_workflow.log` in the current working directory。The log must include:
+- Timestamp for each step
+- **原胞来源：** 从哪获取的（数据库名+材料ID / 文献DOI / 用户文件路径），空间群、晶格参数
+- Supercell matrix and size rationale
+- Each defect structure: what was created, how, which atom removed/replaced/added
+- **电荷态分析：** bulk EIGENVAL 的 VBM/CBM，各缺陷 EIGENVAL 中识别出的缺陷能级（band index、能量、占据数），判定逻辑，最终确定的电荷态列表和对应 NELECT 值
+- NELECT values and charge state determination logic
+- Job submission IDs and status
+- Correction values and method details
+- Formation energy results
+
+Log format:
+```
+[YYYY-MM-DD HH:MM:SS] STEP: <step_name>
+  Description: <what was done>
+  Details: <specifics>
+  Result: <outcome>
+```
+
+**日志示例 — 原胞来源：**
+```
+[2026-03-08 10:00:00] STEP: Primitive Cell Acquisition
+  Description: 获取 CdTe 原胞结构
+  Source: Materials Project, mp-406
+  Space group: F-43m (216)
+  Lattice: a=b=c=6.629 Å, α=β=γ=60°
+  Atoms: 2 (Cd: 1, Te: 1)
+  File: primitive_POSCAR
+```
+
+**日志示例 — 电荷态分析：**
+```
+[2026-03-08 14:00:00] STEP: Charge State Analysis - V_Cd
+  Description: 分析 V_Cd 中性缺陷的 EIGENVAL，确定可能的电荷态
+  Bulk reference:
+    VBM: Band 286-288, E=1.790 eV (3-fold degenerate)
+    CBM: Band 289, E=2.358 eV
+    Band gap: 0.57 eV
+  Defect levels identified:
+    Band 281-283: E=1.751 eV, occ_up=0.667, occ_down=0.667
+    Criteria: partial occupation + near VBM
+    Electrons in defect levels: 3×0.667×2 = 4.0 e⁻
+    Empty states in defect levels: 2.0
+  Charge states determined: q=0, q=-1, q=-2
+  NELECT values: q0=564, q-1=565, q-2=566
+  Reasoning: 3-fold defect level near VBM, 4 electrons present,
+             can accept 2 more → q=-1, q=-2
+```
+
+---
+
+## Workflow Overview
+
+**CRITICAL: 各步骤存在严格的前后依赖关系，不能提前准备后续步骤的输入文件。**
+
+```
+Step 1: Supercell Construction
+    primitive POSCAR → nearly-cubic supercell (min_atom ~ max_atom)
+    → 只准备 Bulk/relax/ 的输入文件 (POSCAR, INCAR, KPOINTS, POTCAR, submit_job)
+    ↓
+Step 2: Bulk Relaxation (ISIF=3)
+    提交 Bulk/relax/ 任务，等待收敛
+    ↓ 【必须等 Bulk/relax 完成】
+Step 3: Defect Structure Generation + Neutral Relaxation Setup
+    用 Bulk/relax/CONTCAR 构建各缺陷 POSCAR
+    → 准备所有 Defect/*/q0/relax/ 的输入文件
+    ↓
+Step 4: Neutral Defect Relaxation (ISIF=2, no NELECT)
+    提交所有 q0/relax/ 任务（可并行），等待收敛
+    ↓ 【必须等所有 q0/relax 完成】
+Step 5: Charge State Determination
+    分析 q0/relax/EIGENVAL 确定各缺陷的带电态
+    ↓
+Step 6: Charged Defect Relaxation Setup + Submission
+    用 q0/relax/CONTCAR 作为起始结构
+    → 准备所有 q±n/relax/ 的输入文件，提交任务
+    ↓ 【必须等所有 charged relax 完成】
+Step 7: Static Calculations Setup + Submission
+    用各 relax/CONTCAR 准备 statics/ 输入文件
+    → Bulk/statics/ + 所有 Defect/*/q*/statics/
+    ↓ 【必须等所有 statics 完成】
+Step 8: Finite-Size Corrections
+    FNV (Freysoldt) or Kumagai correction for charged defects
+    ↓
+Step 9: Formation Energy & Diagram
+    compute E_f, plot formation energy vs Fermi level
+```
+
+### 输入文件准备时机与结构来源
+
+| 阶段 | 准备什么 | POSCAR 来源 | 其他依赖 |
+|------|---------|------------|---------|
+| 初始 | `Bulk/relax/` 的全部输入 | 用户提供的原胞 → 构建超胞 | 无 |
+| Bulk收敛后 | 所有 `q0/relax/` 的输入 | `Bulk/relax/CONTCAR`（移除/替换原子） | 无 |
+| q0收敛后 | 所有 `q±n/relax/` 的输入 | **`q0/relax/CONTCAR`**（已弛豫的中性缺陷结构） | EIGENVAL分析确定电荷态 |
+| 所有relax收敛后 | 所有 `statics/` 的输入 | 各 `relax/CONTCAR` | 各 `relax/CHGCAR`（ICHARG=1） |
+
+**关键：带电缺陷的起始结构是中性弛豫后的 CONTCAR，不是从 bulk 重新构建的缺陷结构。**
+这样做的原因是中性缺陷弛豫后原子位置已经松弛到缺陷附近的平衡位置，以此为起点加/减电子再弛豫，收敛更快、结果更可靠。
+
+---
+
+## Step 1: Supercell Construction
+
+**Goal:** Build a nearly-cubic supercell with 60–70 atoms (configurable via min_atom/max_atom).
+
+**Source:** 原胞结构的获取途径（必须记录到日志）：
+1. **用户直接提供** — 已有的 POSCAR 或 CIF 文件
+2. **数据库下载** — Materials Project、ICSD、COD 等，需记录材料ID（如 mp-406）
+3. **文献构建** — 根据实验晶格参数手动构建，需记录文献来源
+4. **其他来源** — 如从已有计算结果中提取
+
+**Method:**
+1. Read the primitive cell lattice vectors
+2. Find a transformation matrix P such that P × primitive_cell ≈ cubic, with N_atoms in [min_atom, max_atom]
+3. The supercell should minimize the ratio (max_lattice_length / min_lattice_length) to be as cubic as possible
+4. For CdTe zincblende (FCC primitive, 2 atoms): a 4×4×4 FCC = 2×2×2 conventional cubic = 64 atoms
+
+**Log:** Record:
+- **原胞来源：** 从哪获取（数据库名+材料ID / 文献DOI / 用户提供的文件路径）
+- **原胞信息：** 空间群、晶格参数、原子数
+- 超胞变换矩阵、目标原子数、实际原子数
+- 超胞晶格向量、cubicity ratio
+
+**Example supercell (CdTe 64 atoms):**
+```
+Cubic_cell
+1.0
+13.258  0.000  0.000
+ 0.000 13.258  0.000
+ 0.000  0.000 13.258
+Cd Te
+32 32
+```
+
+---
+
+## Step 2: Bulk Relaxation (ISIF=3)
+
+**此步骤是整个流程的起点。初始阶段只准备 `Bulk/relax/` 目录的输入文件。**
+
+**输入文件准备：** 在 `Bulk/relax/` 中放置 POSCAR, INCAR, KPOINTS, POTCAR, submit_job
+
+**INCAR for bulk relaxation:**
+```
+NSW = 500
+NELM = 100
+ISIF = 3              # Full cell + ion relaxation
+IBRION = 2
+POTIM = 0.5
+EDIFF = 1E-5
+EDIFFG = -0.01
+ISMEAR = 0
+SIGMA = 0.05
+GGA = PE              # PBE functional
+IALGO = 38
+LORBIT = 10
+PREC = Accurate
+ISPIN = 2
+ENCUT = <1.3×ENMAX>   # From POTCAR
+NPAR = 8
+```
+
+**KPOINTS:** Gamma-only for large supercells (64+ atoms):
+```
+Gamma
+0
+G
+1 1 1
+0 0 0
+```
+
+**After relaxation:**
+- Use CONTCAR as the relaxed bulk structure
+- Record the final energy from OSZICAR
+- This CONTCAR is the basis for ALL defect structures
+
+**Log:** Record ENCUT source, k-mesh, final energy, lattice parameters change, convergence status.
+
+---
+
+## Step 3: Defect Structure Generation（Bulk弛豫完成后）
+
+**前置条件：** `Bulk/relax/` 已收敛，CONTCAR 可用。
+
+**操作：** 用 `Bulk/relax/CONTCAR` 构建各缺陷 POSCAR，并准备所有 `q0/relax/` 目录的完整输入文件（POSCAR, INCAR, KPOINTS, POTCAR, submit_job）。
+
+Starting from the relaxed bulk CONTCAR, create defect POSCARs:
+
+### Vacancies
+Remove one atom from the supercell:
+- **V_Cd:** Remove 1 Cd atom → (N_Cd - 1) Cd + N_Te Te
+- **V_Te:** Remove 1 Te atom → N_Cd Cd + (N_Te - 1) Te
+
+### Antisites
+Replace one atom with another species:
+- **Te_Cd:** Replace 1 Cd with Te → (N_Cd - 1) Cd + (N_Te + 1) Te
+- **Cd_Te:** Replace 1 Te with Cd → (N_Cd + 1) Cd + (N_Te - 1) Te
+
+### Impurities (Substitutional)
+Replace one host atom with an impurity:
+- **Cl_Te:** Replace 1 Te with Cl → N_Cd Cd + (N_Te - 1) Te + 1 Cl
+- **Na_Cd:** Replace 1 Cd with Na → (N_Cd - 1) Cd + N_Te Te + 1 Na
+
+### Defect complexes
+Create two point defects in the same supercell at various nearest-neighbor distances (nn1, nn2, nn3).
+
+**Log for EACH defect:**
+- Which atom was removed/replaced (index, species, fractional coordinates)
+- Resulting composition and atom count
+- Defect position in the supercell
+
+---
+
+## Step 4: Neutral Defect Relaxation (ISIF=2)
+
+**输入文件已在 Step 3 中准备好（在 `q0/relax/` 目录下）。**
+
+**INCAR for neutral defect relaxation:**
+```
+NSW = 500
+NELM = 100
+ISIF = 2              # Fix cell, relax ions only
+IBRION = 2
+POTIM = 0.5
+EDIFF = 1E-5
+EDIFFG = -0.01
+ISMEAR = 0
+SIGMA = 0.05
+GGA = PE
+IALGO = 38
+LORBIT = 10
+PREC = Accurate
+ISPIN = 2
+ENCUT = <same as bulk>
+NPAR = 8
+```
+
+**Key:** No NELECT tag → VASP auto-determines from POTCAR (neutral defect).
+
+**After relaxation:** CONTCAR becomes the starting structure for charged states.
+
+**Log:** Final energy, convergence status, max force, number of ionic steps.
+
+---
+
+## Step 5: Charge State Determination (from EIGENVAL Analysis)
+
+### Core Method: Compare Defect vs Bulk EIGENVAL
+
+After the neutral defect relaxation (Step 4) and the bulk relaxation/static, compare their EIGENVAL files to:
+1. Identify the **bulk band structure特征** — VBM, CBM, 以及价带/导带的能量分布模式
+2. 在缺陷EIGENVAL中找到**缺陷能级** — 不属于bulk价带或导带的"多出来"的态
+3. 分析缺陷能级的**占据情况**
+4. 据此确定可能的带电态
+
+### Step 5a: 建立bulk参考 — 提取带边和能带分布特征
+
+EIGENVAL format (ISPIN=2): `band_index  E_up  E_down  occ_up  occ_down`
+
+**首先从host EIGENVAL读取带边附近的完整能带结构：**
+```
+Host (CdTe 64-atom, NELECT=576, 288 e⁻/spin):
+
+  --- 价带 (全部 occ=1.0) ---
+  Band 276-277: E ≈ 1.081 eV   ← 价带态 (2重简并)
+  Band 278-285: E ≈ 1.108 eV   ← 价带态 (8重简并)
+  Band 286-288: E ≈ 1.790 eV   ← VBM (3重简并，价带顶)
+  ─────────── 带隙 0.57 eV ───────────
+  Band 289:     E ≈ 2.358 eV   ← CBM (导带底)
+  Band 290-293: E ≈ 3.535 eV   ← 导带态 (4重简并)
+  --- 导带 (全部 occ=0.0) ---
+```
+
+**关键特征要记住：**
+- 价带顶(VBM): 1.790 eV (3重简并)
+- 导带底(CBM): 2.358 eV
+- 带隙: 0.57 eV
+- 价带中的简并模式和能量间距
+
+### Step 5b: 在缺陷EIGENVAL中识别缺陷能级
+
+**识别方法 — 三个判据（综合使用）：**
+
+**判据1: 部分占据 (最直接)**
+占据数在0和1之间的态 (如 occ=0.667) 一定是缺陷能级。因为bulk中所有态要么完全占据(1.0)要么完全空(0.0)，部分占据只会出现在费米面附近的缺陷态上。
+
+**判据2: 在bulk带隙内出现的态**
+能量在bulk VBM (1.790) 和 CBM (2.358) 之间的态是缺陷能级。但要注意：超胞中的本体态会因缺陷影响略有偏移（~0.1 eV），所以需要一定容差。
+
+**判据3: 偏离bulk能带分布模式的"额外"态**
+对比bulk和缺陷的能带分布，找到能量位置明显不同于任何bulk能带的态。具体做法：
+- bulk中价带顶是3重简并的1.790 eV，下面是8重简并的1.108 eV
+- 如果在缺陷EIGENVAL中，在1.108和1.790之间出现了额外的态，或在2.358上方出现了被占据的态，这些就是缺陷态
+
+### Step 5b 实例详解
+
+**V_Cd 中性 (NELECT=564, 282 e⁻/spin):**
+```
+  Band 275-277: E ≈ 1.128 eV, occ=1.0  ← 对应bulk的 ~1.108价带态 (轻微偏移)
+  Band 278-280: E ≈ 1.360 eV, occ=1.0  ← 对应bulk的 ~1.790 VBM? 不对!
+                                           bulk VBM是3重简并的1.790
+                                           这里变成了1.360, 差了0.43 eV
+                                           → 这是价带态,只是被缺陷推移了
+  Band 281-283: E ≈ 1.751 eV, occ=0.667 ←←← 缺陷能级!!!
+                                           ✓ 判据1: 部分占据(0.667≠0或1)
+                                           ✓ 判据2: 在bulk gap附近(1.75, 接近VBM 1.79)
+                                           ✓ 判据3: bulk中此位置没有部分占据的3重简并态
+  Band 284:     E ≈ 2.382 eV, occ=0.0   ← 对应bulk CBM(2.358), 导带态
+```
+
+**V_Te 中性 (NELECT=570, 285 e⁻/spin):**
+```
+  Band 282-284: E ≈ 1.593 eV, occ=1.0  ← 对应bulk ~1.790 VBM (下移了0.2 eV,正常范围)
+  Band 285:     E ≈ 2.187 eV, occ=1.0  ←←← 缺陷能级!!!
+                                           ✓ 判据2: 在bulk带隙内 (1.790 < 2.187 < 2.358)
+                                           ✓ 判据3: bulk中VBM(3重简并)和CBM之间无态
+                                              而这里多出了一个完全占据的态
+                                           注意: occ=1.0, 但位置暴露了它
+  Band 286:     E ≈ 3.320 eV, occ=0.0  ← 导带态
+```
+
+**Te_Cd 中性 (NELECT=570, 285 e⁻/spin):**
+```
+  Band 282-284: E ≈ 1.849 eV, occ=1.0  ← 对应bulk VBM (~1.790, 轻微上移)
+  Band 285:     E ≈ 2.566 eV, occ≈0.82 ←←← 缺陷能级!!!
+                                           ✓ 判据1: 部分占据
+                                           ✓ 判据3: 在bulk CBM(2.358)上方, 却有电子!
+  Band 286-288: E ≈ 2.64-2.72 eV, occ≈0.1 ←←← 缺陷能级!!!
+                                           ✓ 判据1: 部分占据
+                                           ✓ 判据3: 比CBM还高, 却有残余电子
+  Band 289:     E ≈ 3.698 eV, occ=0.0  ← 导带态
+```
+
+**Cd_Te 中性 (NELECT=582, 291 e⁻/spin):**
+```
+  Band 288-290: E ≈ 1.643 eV, occ=1.0  ← 对应bulk VBM
+  Band 291:     E ≈ 2.358 eV, occ=1.0  ←←← 缺陷能级!!!
+                                           ✓ 判据2: 恰好在bulk CBM能量(2.358 eV)
+                                           ✓ 判据3: bulk中此处是空的CBM,
+                                              现在却完全占据→额外的电子在此
+  Band 292:     E ≈ 3.327 eV, occ=0.0  ← 导带态
+```
+
+### Step 5c: 判断方法总结 — 实操流程
+
+```
+1. 从host EIGENVAL提取:
+   - VBM能量和简并度
+   - CBM能量
+   - 价带和导带的能量分布模式(各简并组的能量位置)
+
+2. 在defect EIGENVAL中扫描:
+   (a) 先找部分占据态 → 一定是缺陷能级 [判据1, 最可靠]
+   (b) 再检查带隙区间(VBM~CBM)内有无额外态 → 缺陷能级 [判据2]
+   (c) 对比能带分布模式,找不属于价带或导带的态 → 缺陷能级 [判据3]
+
+3. 统计缺陷能级中的电子数:
+   - 总电子数 = Σ (occ_up + occ_down) for all defect bands
+
+4. 确定电荷态:
+   - 缺陷能级中有N_occ个电子, N_empty个空态
+   - 可移走的电子 → 正电荷态: q = +1, +2, ..., +N_occ
+   - 可加入的电子 → 负电荷态: q = -1, -2, ..., -N_empty
+```
+
+### Step 5d: 从缺陷能级中的电子数确定电荷态和NELECT
+
+### General Rules for Charge State Determination
+
+1. **Identify defect levels:** States inside or near the bulk gap that differ from the bulk band structure
+2. **Count electrons in defect levels:**
+   - Each band holds 1 electron per spin (2 total for ISPIN=2)
+   - Partial occupation (e.g., 0.667) means fractional filling
+3. **Determine removable electrons:** Electrons in defect states above VBM can be removed → positive q
+4. **Determine addable electrons:** Empty defect states below CBM can accept electrons → negative q
+5. **Set NELECT:**
+   ```
+   NELECT = NELECT_neutral - q
+   ```
+   (q>0 means fewer electrons; q<0 means more electrons)
+
+### NELECT Reference Table (CdTe)
+
+| Structure | Composition | NELECT_neutral | ZVAL source |
+|-----------|------------|----------------|-------------|
+| Bulk 64-atom | Cd₃₂Te₃₂ | 576 | 32×12 + 32×6 |
+| V_Cd | Cd₃₁Te₃₂ | 564 | 31×12 + 32×6 |
+| V_Te | Cd₃₂Te₃₁ | 570 | 32×12 + 31×6 |
+| Te_Cd | Cd₃₁Te₃₃ | 570 | 31×12 + 33×6 |
+| Cd_Te | Cd₃₃Te₃₁ | 582 | 33×12 + 31×6 |
+
+**Log for EACH defect:** Record:
+- Bulk VBM and CBM eigenvalues
+- Defect level positions and occupations (band index, energy, occ_up, occ_down)
+- Number of electrons in defect levels
+- Reasoning: which electrons can be added/removed
+- Resulting charge state list and NELECT values
+
+---
+
+## Step 6: Charged Defect Relaxation（q0弛豫完成后）
+
+**前置条件：** 所有 `q0/relax/` 已收敛，且 Step 5 的电荷态分析已完成。
+
+**操作：**
+1. 将 `q0/relax/CONTCAR` 复制为各 `q±n/relax/POSCAR`
+2. 准备 INCAR（加 NELECT）、KPOINTS、POTCAR、submit_job
+3. 提交所有 charged relax 任务（可并行）
+
+**Starting structure:** CONTCAR from the neutral (q=0) relaxation.
+
+**INCAR:** Same as neutral relaxation, but add:
+```
+NELECT = <calculated value>
+```
+
+**Directory structure:**
+```
+ProjectRoot/
+├── Bulk/
+│   ├── relax/                    # Bulk relaxation (ISIF=3)
+│   └── statics/                  # Bulk static calculation
+├── Defect/
+│   ├── Intrinsic/
+│   │   ├── V_Cd/
+│   │   │   ├── q0/
+│   │   │   │   ├── relax/        # Neutral relaxation
+│   │   │   │   └── statics/      # Static after relax
+│   │   │   ├── q-1/
+│   │   │   │   ├── relax/        # Charged relaxation (NELECT+1)
+│   │   │   │   └── statics/
+│   │   │   └── q-2/
+│   │   │       ├── relax/        # Charged relaxation (NELECT+2)
+│   │   │       └── statics/
+│   │   ├── V_Te/
+│   │   │   ├── q0/
+│   │   │   │   ├── relax/
+│   │   │   │   └── statics/
+│   │   │   ├── q+1/
+│   │   │   │   ├── relax/
+│   │   │   │   └── statics/
+│   │   │   └── q+2/
+│   │   │       ├── relax/
+│   │   │       └── statics/
+│   │   ├── Te_Cd/
+│   │   │   └── ...             # Same pattern: q*/relax/, q*/statics/
+│   │   └── Cd_Te/
+│   │       └── ...
+│   └── Impurity/
+│       ├── Cl_Te/
+│       │   └── ...             # Same pattern
+│       └── Na_Cd/
+│           └── ...
+├── ThermoStability/              # Chemical potential & stability analysis
+└── FormationEnergy/              # Formation energy results & plots
+```
+
+**Key:** Each charged calculation starts from the relaxed neutral CONTCAR, NOT from the unrelaxed defect POSCAR.
+
+**Log:** Record starting POSCAR source, NELECT value, convergence for each charge state.
+
+---
+
+## Step 7: Static Calculations（所有弛豫完成后）
+
+**前置条件：** `Bulk/relax/` 和所有 `Defect/*/q*/relax/` 已收敛。
+
+**操作：**
+1. 将各 `relax/CONTCAR` 复制为对应 `statics/POSCAR`
+2. 将各 `relax/CHGCAR` 复制到对应 `statics/`（ICHARG=1 需要读取）
+3. 准备 INCAR（静态参数）、KPOINTS、POTCAR、submit_job
+4. 提交所有 statics 任务（可并行）
+
+需要准备的 statics 目录：
+- `Bulk/statics/` — 使用 `Bulk/relax/CONTCAR`
+- 所有 `Defect/*/q*/statics/` — 使用对应 `relax/CONTCAR`
+
+**INCAR for static:**
+```
+NELM = 100
+EDIFF = 1E-5
+ISMEAR = 0
+SIGMA = 0.05
+GGA = PE
+IALGO = 38
+LORBIT = 10
+PREC = Accurate
+ISPIN = 2
+ENCUT = <same as relaxation>
+NPAR = 8
+ICORELEVEL = 1        # Core-level eigenvalues for Kumagai correction
+LVHAR = .TRUE.        # Write LOCPOT for Freysoldt correction
+ICHARG = 1            # Read CHGCAR from relaxation
+```
+
+**Note:** No NSW, no IBRION → single-point calculation. Copy CHGCAR from the relaxation to the static directory (ICHARG=1 reads it).
+
+**Required outputs:** LOCPOT (for FNV correction), OUTCAR (for energies and site potentials).
+
+**Log:** Record total energies from each static calculation.
+
+---
+
+## Step 8: Finite-Size Corrections
+
+### Freysoldt (FNV) Correction
+
+For **each charged defect** (q ≠ 0):
+
+**Required inputs:**
+- Bulk LOCPOT (from host static)
+- Defect LOCPOT (from defect static)
+- Dielectric constant ε (scalar for cubic systems)
+- Charge state q
+- Supercell lattice vectors
+
+**The correction consists of:**
+1. **Electrostatic (Madelung) energy:** Energy of a point charge q in a periodic box screened by ε
+   ```
+   E_Madelung = α_M × q² / (2 × ε × L)
+   ```
+   where α_M is the Madelung constant for the supercell geometry and L is the characteristic length.
+
+2. **Potential alignment ΔV:** From comparing planar-averaged potentials of bulk and defect LOCPOT along each axis. Far from the defect, the difference should plateau → that plateau value is ΔV.
+
+3. **Total correction:**
+   ```
+   E_corr = E_Madelung + q × ΔV
+   ```
+
+**Log for EACH charged defect:**
+```
+Defect: V_Cd q=-2
+  Madelung energy: X.XXX eV
+  Potential alignment: X.XXX eV
+  Total FNV correction: X.XXX eV
+  Uncorrected formation energy: X.XXX eV
+  Corrected formation energy: X.XXX eV
+```
+
+### Madelung Constant Calculation
+
+The Madelung constant for the supercell can be computed via a separate VASP calculation:
+- Place a single test charge (NELECT=2) in the supercell
+- Use NELM=1, IDIPOL=4, ALGO=Fast
+- Extract the Madelung energy from the output
+
+**INCAR for Madelung:**
+```
+NELM = 1
+EDIFF = 1E-5
+ISMEAR = 0
+SIGMA = 0.05
+GGA = PE
+PREC = Accurate
+ISPIN = 2
+ENCUT = <same>
+NPAR = 8
+ICORELEVEL = 1
+LVHAR = .TRUE.
+ICHARG = 1
+NELECT = 2
+IDIPOL = 4
+ALGO = Fast
+```
+
+---
+
+## Step 9: Formation Energy & Diagram
+
+### Formation Energy Formula
+
+```
+E_f[X^q] = E_tot[X^q] - E_tot[bulk] + Σ(n_i × μ_i) + q × (E_VBM + E_Fermi) + E_corr
+```
+
+**Terms from VASP:**
+- `E_tot[X^q]` = total energy from defect static calculation (sigma→0)
+- `E_tot[bulk]` = total energy from host static calculation
+- `n_i` = number of atoms removed (+) or added (-) of species i
+- `μ_i` = chemical potential (from stability region analysis)
+- `E_VBM` = VBM eigenvalue from host calculation
+- `q` = charge state
+- `E_corr` = FNV or Kumagai correction
+
+### Chemical Potential Limits
+
+For binary AB compound:
+```
+μ_A + μ_B = E_bulk_per_formula
+ΔH_f = E_AB - E_A(elemental) - E_B(elemental)
+```
+
+**p1 (A-rich):** Δμ_A = 0, Δμ_B = ΔH_f
+**p2 (B-rich):** Δμ_B = 0, Δμ_A = ΔH_f
+
+Example from dasp.in:
+```
+E_pure = -1.7736 -4.6974      # E/atom for Cd, Te elemental phases
+p1 = 0.0 -1.1854              # Cd-rich: Δμ_Cd=0, Δμ_Te=-1.1854
+p2 = -1.1854 0.0              # Te-rich: Δμ_Cd=-1.1854, Δμ_Te=0
+```
+
+### Plotting
+
+The formation energy diagram shows E_f vs E_Fermi (from 0=VBM to E_gap=CBM). Each charge state is a line with slope q. Plot the **lower envelope** (stable charge states only) for each defect.
+
+**Log:** Record ALL formation energies, transition levels, and the final plot file path.
+
+---
+
+## SLURM Job Automation
+
+### Job Script Template
+
+Based on the user's cluster configuration:
+```bash
+#!/bin/sh
+#SBATCH -N <node_number>
+#SBATCH -J <job_name>
+#SBATCH -n <total_cores>
+#SBATCH --ntasks-per-node=<core_per_node>
+#SBATCH --partition=<queue>
+#SBATCH --output=%j.out
+#SBATCH --error=%j.err
+#SBATCH --time=<max_time>
+
+mpirun -n <total_cores> <vasp_path> > vasp.out 2>&1
+```
+
+**Default values (from dasp.in):**
+```
+node_number = 2
+core_per_node = 52
+queue = compute2
+max_time = 24:00:00
+vasp_gam = /opt/vasp.5.4.4/bin/vasp_gam
+vasp_std = /opt/vasp.5.4.4/bin/vasp_std
+```
+
+### VASP Executable Selection
+- **Gamma-only KPOINTS (1×1×1):** Use `vasp_gam` (faster)
+- **Multiple k-points:** Use `vasp_std`
+
+### 自动监控与调度系统
+
+**核心思路：** 后台监控脚本 `auto_monitor.sh` 每10分钟检查一次任务状态，收敛后自动准备下一阶段输入文件并提交。全程无需人工干预。
+
+**需要的文件：**
+1. `defect_config.txt` — 定义缺陷类型、操作方式、电荷态
+2. `prepare_defect.py` — Python辅助脚本，处理POSCAR构建缺陷结构
+3. `auto_monitor.sh` — 主监控循环脚本（后台运行）
+
+#### 1. defect_config.txt 格式
+
+```
+# 缺陷配置文件
+# category  name  operation  atom_index  replace_element  charge_states
+#
+# category: intrinsic / impurity
+# operation: vacancy / antisite / substitute
+# atom_index: 从1开始的原子序号（在超胞POSCAR中的位置）
+# replace_element: 替换为的元素（vacancy填 - ）
+# charge_states: 逗号分隔的带电态（不含q0，q0自动包含）
+#
+intrinsic  V_Cd    vacancy     1    -    -1,-2
+intrinsic  V_Te    vacancy     33   -    +1,+2
+intrinsic  Te_Cd   antisite    1    Te   -1,-2,+1,+2
+intrinsic  Cd_Te   antisite    33   Cd   -1,-2,+1,+2
+impurity   Cl_Te   substitute  33   Cl   +1,-1
+impurity   Na_Cd   substitute  1    Na   -1,+1
+```
+
+#### 2. prepare_defect.py — POSCAR缺陷结构构建
+
+```python
+#!/usr/bin/env python3
+"""从bulk CONTCAR构建缺陷POSCAR"""
+import sys
+import os
+
+def read_poscar(filepath):
+    """读取POSCAR，返回 (comment, scale, lattice, species, counts, coord_type, coords)"""
+    with open(filepath) as f:
+        lines = f.readlines()
+    comment = lines[0].strip()
+    scale = float(lines[1])
+    lattice = [lines[i].split() for i in range(2, 5)]
+    species = lines[5].split()
+    counts = list(map(int, lines[6].split()))
+    coord_type = lines[7].strip()
+    total = sum(counts)
+    coords = []
+    for i in range(8, 8 + total):
+        coords.append(lines[i].strip())
+    return comment, scale, lattice, species, counts, coord_type, coords
+
+def write_poscar(filepath, comment, scale, lattice, species, counts, coord_type, coords):
+    """写POSCAR"""
+    with open(filepath, 'w') as f:
+        f.write(comment + '\n')
+        f.write(f'{scale}\n')
+        for v in lattice:
+            f.write('  ' + '  '.join(v) + '\n')
+        f.write('  '.join(species) + '\n')
+        f.write('  '.join(map(str, counts)) + '\n')
+        f.write(coord_type + '\n')
+        for c in coords:
+            f.write(c + '\n')
+
+def create_vacancy(bulk_poscar, atom_index, output_poscar):
+    """移除第atom_index个原子（从1开始计数）"""
+    comment, scale, lattice, species, counts, coord_type, coords = read_poscar(bulk_poscar)
+    idx = atom_index - 1  # 转为0-based
+    # 确定该原子属于哪个species
+    cumsum = 0
+    for i, c in enumerate(counts):
+        if cumsum + c > idx:
+            species_idx = i
+            break
+        cumsum += c
+    coords.pop(idx)
+    counts[species_idx] -= 1
+    # 移除count为0的species
+    new_species, new_counts = [], []
+    for s, c in zip(species, counts):
+        if c > 0:
+            new_species.append(s)
+            new_counts.append(c)
+    comment = f'Vacancy at site {atom_index}'
+    write_poscar(output_poscar, comment, scale, lattice, new_species, new_counts, coord_type, coords)
+
+def create_antisite_or_substitute(bulk_poscar, atom_index, new_element, output_poscar):
+    """将第atom_index个原子替换为new_element"""
+    comment, scale, lattice, species, counts, coord_type, coords = read_poscar(bulk_poscar)
+    idx = atom_index - 1
+    # 找到被替换原子的species和坐标
+    cumsum = 0
+    for i, c in enumerate(counts):
+        if cumsum + c > idx:
+            old_species_idx = i
+            break
+        cumsum += c
+    replaced_coord = coords.pop(idx)
+    counts[old_species_idx] -= 1
+    # 添加新元素
+    if new_element in species:
+        new_idx = species.index(new_element)
+        # 插入到该species段的末尾
+        insert_pos = sum(counts[:new_idx+1])
+        coords.insert(insert_pos, replaced_coord)
+        counts[new_idx] += 1
+    else:
+        species.append(new_element)
+        counts.append(1)
+        coords.append(replaced_coord)
+    # 清理count为0的species
+    new_species, new_counts = [], []
+    for s, c in zip(species, counts):
+        if c > 0:
+            new_species.append(s)
+            new_counts.append(c)
+    comment = f'Replace site {atom_index} with {new_element}'
+    write_poscar(output_poscar, comment, scale, lattice, new_species, new_counts, coord_type, coords)
+
+if __name__ == '__main__':
+    operation = sys.argv[1]     # vacancy / antisite / substitute
+    bulk_poscar = sys.argv[2]   # Bulk/relax/CONTCAR
+    atom_index = int(sys.argv[3])
+    output_poscar = sys.argv[4]
+    if operation == 'vacancy':
+        create_vacancy(bulk_poscar, atom_index, output_poscar)
+    else:
+        new_element = sys.argv[5]
+        create_antisite_or_substitute(bulk_poscar, atom_index, new_element, output_poscar)
+```
+
+#### 3. auto_monitor.sh — 主监控脚本
+
+```bash
+#!/bin/bash
+# auto_monitor.sh — 后台自动监控，每10分钟检查收敛，自动准备下一阶段并提交
+#
+# 使用方法:
+#   nohup bash auto_monitor.sh > monitor.out 2>&1 &
+#   nohup bash auto_monitor.sh --claude > monitor.out 2>&1 &   # 启用AI审查
+#   echo $! > monitor.pid
+#
+# 停止监控:
+#   kill $(cat monitor.pid)
+
+# ============ 参数解析 ============
+USE_CLAUDE=false
+for arg in "$@"; do
+    case $arg in
+        --claude) USE_CLAUDE=true ;;
+    esac
+done
+
+WORKDIR=$(pwd)
+LOG="$WORKDIR/defect_workflow.log"
+CONFIG="$WORKDIR/defect_config.txt"
+PREPARE_PY="$WORKDIR/prepare_defect.py"
+INTERVAL=600  # 10分钟 = 600秒
+
+# ============ VASP 参数配置（按实际情况修改） ============
+ENCUT=350              # 根据POTCAR的ENMAX × 1.3
+VASP_GAM="/opt/vasp.5.4.4/bin/vasp_gam"
+NODE_NUMBER=2
+CORE_PER_NODE=52
+TOTAL_CORES=$((NODE_NUMBER * CORE_PER_NODE))
+QUEUE="compute2"
+MAX_TIME="24:00:00"
+
+# ============ 辅助函数 ============
+
+log_msg() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOG
+    echo "[$(date '+%H:%M:%S')] $1"
+}
+
+is_converged() {
+    # 检查OUTCAR是否包含收敛标志
+    grep -q "reached required accuracy" "$1/OUTCAR" 2>/dev/null
+}
+
+has_error() {
+    grep -q "Error\|ZBRENT\|VERY BAD NEWS" "$1/vasp.out" 2>/dev/null
+}
+
+is_running() {
+    # 有OUTCAR但未收敛且无错误 → 仍在运行（或队列中）
+    [ -f "$1/OUTCAR" ] && ! is_converged "$1" && ! has_error "$1"
+}
+
+is_submitted() {
+    # POSCAR存在且有submit_job，但可能还在队列中
+    [ -f "$1/POSCAR" ] && [ -f "$1/submit_job" ]
+}
+
+get_nelect_from_outcar() {
+    # 从OUTCAR中提取NELECT值
+    grep "NELECT" "$1/OUTCAR" 2>/dev/null | head -1 | awk '{print $3}' | cut -d. -f1
+}
+
+write_submit_job() {
+    # $1=目录 $2=job_name
+    cat > "$1/submit_job" << SUBMIT_EOF
+#!/bin/sh
+#SBATCH -N ${NODE_NUMBER}
+#SBATCH -J $2
+#SBATCH -n ${TOTAL_CORES}
+#SBATCH --ntasks-per-node=${CORE_PER_NODE}
+#SBATCH --partition=${QUEUE}
+#SBATCH --output=%j.out
+#SBATCH --error=%j.err
+#SBATCH --time=${MAX_TIME}
+
+mpirun -n ${TOTAL_CORES} ${VASP_GAM} > vasp.out 2>&1
+SUBMIT_EOF
+}
+
+write_kpoints() {
+    cat > "$1/KPOINTS" << KPOINTS_EOF
+Gamma
+0
+G
+1 1 1
+0 0 0
+KPOINTS_EOF
+}
+
+write_incar_relax() {
+    # $1=目录 $2=ISIF值 $3=可选NELECT
+    local nelect_line=""
+    [ -n "$3" ] && nelect_line="NELECT = $3"
+    cat > "$1/INCAR" << INCAR_EOF
+NSW = 500
+NELM = 100
+ISIF = $2
+IBRION = 2
+POTIM = 0.5
+EDIFF = 1E-5
+EDIFFG = -0.01
+ISMEAR = 0
+SIGMA = 0.05
+GGA = PE
+IALGO = 38
+LORBIT = 10
+PREC = Accurate
+ISPIN = 2
+ENCUT = ${ENCUT}
+NPAR = 8
+${nelect_line}
+INCAR_EOF
+}
+
+write_incar_static() {
+    # $1=目录 $2=可选NELECT
+    local nelect_line=""
+    [ -n "$2" ] && nelect_line="NELECT = $2"
+    cat > "$1/INCAR" << INCAR_EOF
+NELM = 100
+EDIFF = 1E-5
+ISMEAR = 0
+SIGMA = 0.05
+GGA = PE
+IALGO = 38
+LORBIT = 10
+PREC = Accurate
+ISPIN = 2
+ENCUT = ${ENCUT}
+NPAR = 8
+ICORELEVEL = 1
+LVHAR = .TRUE.
+ICHARG = 1
+${nelect_line}
+INCAR_EOF
+}
+
+submit_dir() {
+    # $1=目录 $2=标签
+    cd "$1"
+    local JOB=$(sbatch --parsable submit_job 2>/dev/null)
+    if [ -n "$JOB" ]; then
+        log_msg "SUBMITTED: $2 → Job $JOB"
+    else
+        log_msg "ERROR: Failed to submit $2"
+    fi
+    cd "$WORKDIR"
+}
+
+# ============ Claude AI 审查函数 ============
+
+claude_review() {
+    # 使用Claude审查VASP计算结果，检测异常
+    # $1=目录路径 $2=计算类型标签 $3=计算类型(relax/static)
+    $USE_CLAUDE || return 0  # 未启用--claude则跳过
+
+    local calc_dir="$1"
+    local label="$2"
+    local calc_type="${3:-relax}"
+    local review_file="$calc_dir/claude_review.txt"
+
+    log_msg "CLAUDE_REVIEW: 开始审查 $label ..."
+
+    # 构建审查prompt
+    local prompt="你是VASP计算结果审查专家。请检查以下目录中的计算结果，判断是否存在异常。
+
+目录: $calc_dir
+计算类型: $calc_type
+
+请依次检查以下内容，给出简洁判断（正常/异常+原因）：
+
+1. **收敛性**: 检查 OSZICAR 的能量变化趋势，是否单调下降？最终几步能量变化是否<1meV？有无能量震荡？
+2. **电子步收敛**: OUTCAR 中每个离子步的电子步数是否合理（一般<40步）？有无反复不收敛？
+3. **力和应力**: OUTCAR 末尾的原子力是否合理（一般<0.01 eV/Å）？有无异常大的力？
+4. **磁矩**: OUTCAR 中的总磁矩是否合理？对于该缺陷类型，磁矩是否符合预期？
+5. **能量合理性**: 最终能量是否在合理范围？与同类计算相比是否异常偏大/偏小？
+6. **结构变化**: 对比 POSCAR 和 CONTCAR，原子位移是否合理？有无原子飞走或结构坍塌？"
+
+    if [ "$calc_type" = "static" ]; then
+        prompt="$prompt
+7. **LOCPOT**: 检查 LOCPOT 文件是否正常生成（文件大小>0）？
+8. **带边**: 检查 EIGENVAL 中的 VBM/CBM 位置是否合理？"
+    fi
+
+    prompt="$prompt
+
+最后给出总结：PASS（无异常）或 WARNING（有潜在问题，列出）或 FAIL（严重问题，必须处理）。
+
+请直接读取该目录下的 OSZICAR、OUTCAR（最后200行）、POSCAR、CONTCAR 来分析。"
+
+    # 调用 claude CLI（非交互模式）
+    local review_result
+    review_result=$(claude -p "$prompt" \
+        --allowedTools "Read,Bash" \
+        --max-turns 10 \
+        2>/dev/null)
+
+    # 保存审查结果
+    echo "====== Claude Review: $label ======" > "$review_file"
+    echo "Date: $(date '+%Y-%m-%d %H:%M:%S')" >> "$review_file"
+    echo "" >> "$review_file"
+    echo "$review_result" >> "$review_file"
+
+    # 提取结论（PASS/WARNING/FAIL）
+    local verdict="UNKNOWN"
+    if echo "$review_result" | grep -qi "FAIL"; then
+        verdict="FAIL"
+    elif echo "$review_result" | grep -qi "WARNING"; then
+        verdict="WARNING"
+    elif echo "$review_result" | grep -qi "PASS"; then
+        verdict="PASS"
+    fi
+
+    log_msg "CLAUDE_REVIEW: $label → $verdict (详见 $review_file)"
+
+    # FAIL时暂停自动流程
+    if [ "$verdict" = "FAIL" ]; then
+        log_msg "CLAUDE_REVIEW: ⚠ $label 审查未通过，暂停自动推进，请人工检查 $review_file"
+        return 1  # 返回非0，阻止phase推进
+    fi
+    return 0
+}
+
+claude_review_phase() {
+    # 对一批已收敛的计算目录进行Claude审查
+    # $1=phase名 $2...=目录列表（空格分隔的 "dir|label" 对）
+    $USE_CLAUDE || return 0
+
+    local phase_name="$1"
+    shift
+    local all_pass=true
+
+    for entry in "$@"; do
+        local dir="${entry%%|*}"
+        local label="${entry##*|}"
+        local calc_type="relax"
+        [[ "$dir" == *statics* ]] && calc_type="static"
+
+        if ! claude_review "$dir" "$label" "$calc_type"; then
+            all_pass=false
+        fi
+    done
+
+    if ! $all_pass; then
+        log_msg "CLAUDE_REVIEW: $phase_name 中有计算未通过审查，暂停推进"
+        return 1
+    fi
+    return 0
+}
+
+# ============ Phase 处理函数 ============
+
+phase1_check_and_advance() {
+    # Phase 1: Bulk/relax 收敛 → 准备所有 q0/relax 输入 → 提交
+    if ! is_converged "$WORKDIR/Bulk/relax"; then
+        if has_error "$WORKDIR/Bulk/relax"; then
+            log_msg "ERROR: Bulk/relax 出错，请人工检查"
+        fi
+        return 1
+    fi
+
+    # 检查是否已经进入Phase2（q0/relax已存在输入文件）
+    local first_q0=$(find "$WORKDIR/Defect" -path "*/q0/relax/POSCAR" 2>/dev/null | head -1)
+    [ -n "$first_q0" ] && return 0  # 已准备过，跳过
+
+    # Claude审查 Bulk/relax
+    claude_review_phase "Phase1" "$WORKDIR/Bulk/relax|Bulk/relax" || return 1
+
+    log_msg "Phase1→2: Bulk/relax CONVERGED, 开始准备缺陷结构..."
+    local BULK_CONTCAR="$WORKDIR/Bulk/relax/CONTCAR"
+    local BULK_POTCAR="$WORKDIR/Bulk/relax/POTCAR"
+
+    # 读取config，构建缺陷结构并准备q0/relax输入
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 跳过注释和空行
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        read -r category name operation atom_index replace_elem charge_states <<< "$line"
+
+        local cat_dir
+        [ "$category" = "intrinsic" ] && cat_dir="Intrinsic" || cat_dir="Impurity"
+        local defect_base="$WORKDIR/Defect/$cat_dir/$name"
+        local q0_relax="$defect_base/q0/relax"
+        mkdir -p "$q0_relax"
+
+        # 用Python构建缺陷POSCAR
+        if [ "$operation" = "vacancy" ]; then
+            python3 "$PREPARE_PY" vacancy "$BULK_CONTCAR" "$atom_index" "$q0_relax/POSCAR"
+        else
+            python3 "$PREPARE_PY" "$operation" "$BULK_CONTCAR" "$atom_index" "$q0_relax/POSCAR" "$replace_elem"
+        fi
+
+        # 准备其他输入文件
+        write_incar_relax "$q0_relax" 2
+        write_kpoints "$q0_relax"
+        cp "$BULK_POTCAR" "$q0_relax/POTCAR"
+        write_submit_job "$q0_relax" "${name}_q0"
+
+        # 提交
+        submit_dir "$q0_relax" "$name/q0/relax"
+
+        log_msg "Phase2: 准备并提交 $name/q0/relax (operation=$operation, atom=$atom_index)"
+    done < "$CONFIG"
+
+    return 0
+}
+
+phase2_check_and_advance() {
+    # Phase 2: 所有 q0/relax 收敛 → 准备 charged relax 输入 → 提交
+    local all_q0_done=true
+    local any_q0_exists=false
+
+    for q0_dir in "$WORKDIR"/Defect/Intrinsic/*/q0/relax "$WORKDIR"/Defect/Impurity/*/q0/relax; do
+        [ -d "$q0_dir" ] || continue
+        any_q0_exists=true
+        if ! is_converged "$q0_dir"; then
+            if has_error "$q0_dir"; then
+                local dname=$(basename $(dirname $(dirname "$q0_dir")))
+                log_msg "ERROR: $dname/q0/relax 出错，请人工检查"
+            fi
+            all_q0_done=false
+        fi
+    done
+
+    $any_q0_exists || return 1  # 还没有q0目录
+    $all_q0_done || return 1
+
+    # 检查是否已经进入Phase3（charged relax已存在）
+    local first_charged=$(find "$WORKDIR/Defect" -path "*/q[+-]*/relax/POSCAR" 2>/dev/null | head -1)
+    [ -n "$first_charged" ] && return 0  # 已准备过
+
+    # Claude审查所有 q0/relax
+    local review_list=()
+    for q0_dir in "$WORKDIR"/Defect/Intrinsic/*/q0/relax "$WORKDIR"/Defect/Impurity/*/q0/relax; do
+        [ -d "$q0_dir" ] || continue
+        local dname=$(basename $(dirname $(dirname "$q0_dir")))
+        review_list+=("$q0_dir|$dname/q0/relax")
+    done
+    claude_review_phase "Phase2" "${review_list[@]}" || return 1
+
+    log_msg "Phase2→3: All q0/relax CONVERGED, 开始准备带电缺陷..."
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        read -r category name operation atom_index replace_elem charge_states <<< "$line"
+
+        local cat_dir
+        [ "$category" = "intrinsic" ] && cat_dir="Intrinsic" || cat_dir="Impurity"
+        local defect_base="$WORKDIR/Defect/$cat_dir/$name"
+        local q0_relax="$defect_base/q0/relax"
+
+        # 获取中性NELECT
+        local nelect_neutral=$(get_nelect_from_outcar "$q0_relax")
+
+        # 遍历各电荷态
+        IFS=',' read -ra charges <<< "$charge_states"
+        for q in "${charges[@]}"; do
+            q=$(echo "$q" | tr -d ' ')
+            local q_dir="$defect_base/q${q}/relax"
+            mkdir -p "$q_dir"
+
+            # POSCAR: 从q0弛豫后的CONTCAR复制
+            cp "$q0_relax/CONTCAR" "$q_dir/POSCAR"
+
+            # 计算NELECT: NELECT = NELECT_neutral - q
+            local q_num=$(echo "$q" | sed 's/+//')
+            local nelect=$((nelect_neutral - q_num))
+
+            write_incar_relax "$q_dir" 2 "$nelect"
+            write_kpoints "$q_dir"
+            cp "$q0_relax/POTCAR" "$q_dir/POTCAR"
+            write_submit_job "$q_dir" "${name}_q${q}"
+
+            submit_dir "$q_dir" "$name/q${q}/relax"
+
+            log_msg "Phase3: 准备并提交 $name/q${q}/relax (NELECT=$nelect, from q0 CONTCAR)"
+        done
+    done < "$CONFIG"
+
+    return 0
+}
+
+phase3_check_and_advance() {
+    # Phase 3: 所有 relax 收敛 → 准备所有 statics 输入 → 提交
+    local all_relax_done=true
+    local any_charged_exists=false
+
+    # 检查所有charged relax
+    for relax_dir in "$WORKDIR"/Defect/Intrinsic/*/q[+-]*/relax "$WORKDIR"/Defect/Impurity/*/q[+-]*/relax; do
+        [ -d "$relax_dir" ] || continue
+        any_charged_exists=true
+        if ! is_converged "$relax_dir"; then
+            if has_error "$relax_dir"; then
+                local dname=$(basename $(dirname $(dirname "$relax_dir")))
+                local qname=$(basename $(dirname "$relax_dir"))
+                log_msg "ERROR: $dname/$qname/relax 出错，请人工检查"
+            fi
+            all_relax_done=false
+        fi
+    done
+
+    $any_charged_exists || return 1
+    $all_relax_done || return 1
+
+    # 检查是否已经进入Phase4（statics已存在）
+    local first_static=$(find "$WORKDIR/Defect" -path "*/statics/POSCAR" 2>/dev/null | head -1)
+    [ -n "$first_static" ] && return 0
+
+    # Claude审查所有 charged relax
+    local review_list=()
+    for relax_dir in "$WORKDIR"/Defect/Intrinsic/*/q[+-]*/relax "$WORKDIR"/Defect/Impurity/*/q[+-]*/relax; do
+        [ -d "$relax_dir" ] || continue
+        is_converged "$relax_dir" || continue
+        local dname=$(basename $(dirname $(dirname "$relax_dir")))
+        local qname=$(basename $(dirname "$relax_dir"))
+        review_list+=("$relax_dir|$dname/$qname/relax")
+    done
+    claude_review_phase "Phase3" "${review_list[@]}" || return 1
+
+    log_msg "Phase3→4: All charged relax CONVERGED, 开始准备static计算..."
+
+    # --- Bulk/statics ---
+    local bulk_statics="$WORKDIR/Bulk/statics"
+    mkdir -p "$bulk_statics"
+    cp "$WORKDIR/Bulk/relax/CONTCAR" "$bulk_statics/POSCAR"
+    cp "$WORKDIR/Bulk/relax/CHGCAR" "$bulk_statics/CHGCAR"
+    cp "$WORKDIR/Bulk/relax/POTCAR" "$bulk_statics/POTCAR"
+    write_incar_static "$bulk_statics"
+    write_kpoints "$bulk_statics"
+    write_submit_job "$bulk_statics" "bulk_static"
+    submit_dir "$bulk_statics" "Bulk/statics"
+
+    # --- 所有 defect statics ---
+    for relax_dir in "$WORKDIR"/Defect/Intrinsic/*/q*/relax "$WORKDIR"/Defect/Impurity/*/q*/relax; do
+        [ -d "$relax_dir" ] || continue
+        is_converged "$relax_dir" || continue
+
+        local q_dir=$(dirname "$relax_dir")
+        local statics_dir="$q_dir/statics"
+        local defect_name=$(basename $(dirname "$q_dir"))
+        local charge=$(basename "$q_dir")
+        mkdir -p "$statics_dir"
+
+        cp "$relax_dir/CONTCAR" "$statics_dir/POSCAR"
+        cp "$relax_dir/CHGCAR" "$statics_dir/CHGCAR"
+        cp "$relax_dir/POTCAR" "$statics_dir/POTCAR"
+        write_kpoints "$statics_dir"
+
+        # 获取NELECT（如果是带电态）
+        local nelect=""
+        if [[ "$charge" != "q0" ]]; then
+            nelect=$(get_nelect_from_outcar "$relax_dir")
+        fi
+        write_incar_static "$statics_dir" "$nelect"
+        write_submit_job "$statics_dir" "${defect_name}_${charge}_static"
+
+        submit_dir "$statics_dir" "$defect_name/$charge/statics"
+        log_msg "Phase4: 准备并提交 $defect_name/$charge/statics"
+    done
+
+    return 0
+}
+
+phase4_check_completion() {
+    # Phase 4: 所有 statics 收敛 → 整个流程完成
+    local all_done=true
+    local any_static_exists=false
+
+    # Bulk/statics
+    if [ -d "$WORKDIR/Bulk/statics" ]; then
+        any_static_exists=true
+        is_converged "$WORKDIR/Bulk/statics" || all_done=false
+    fi
+
+    for statics_dir in "$WORKDIR"/Defect/Intrinsic/*/q*/statics "$WORKDIR"/Defect/Impurity/*/q*/statics; do
+        [ -d "$statics_dir" ] || continue
+        any_static_exists=true
+        if ! is_converged "$statics_dir"; then
+            if has_error "$statics_dir"; then
+                local dname=$(basename $(dirname $(dirname "$statics_dir")))
+                local qname=$(basename $(dirname "$statics_dir"))
+                log_msg "ERROR: $dname/$qname/statics 出错，请人工检查"
+            fi
+            all_done=false
+        fi
+    done
+
+    $any_static_exists || return 1
+    if $all_done; then
+        log_msg "===== ALL PHASES COMPLETE ====="
+        log_msg "所有static计算已收敛，可以进行有限尺寸修正和形成能计算"
+        return 0
+    fi
+    return 1
+}
+
+# ============ 状态报告 ============
+
+print_status() {
+    echo ""
+    echo "=== Status Report $(date '+%Y-%m-%d %H:%M:%S') ==="
+
+    check_one() {
+        local dir=$1 label=$2
+        [ -d "$dir" ] || return
+        if is_converged "$dir"; then
+            local E=$(grep "energy  without entropy" $dir/OUTCAR | tail -1 | awk '{print $NF}')
+            echo "  CONVERGED  $label  (E=$E eV)"
+        elif has_error "$dir"; then
+            echo "  ERROR      $label"
+        elif [ -f "$dir/OUTCAR" ]; then
+            local steps=$(grep -c "F=" $dir/OSZICAR 2>/dev/null || echo "?")
+            echo "  RUNNING    $label  (steps: $steps)"
+        elif [ -f "$dir/POSCAR" ]; then
+            echo "  READY      $label"
+        else
+            echo "  NOT_READY  $label"
+        fi
+    }
+
+    echo "--- Bulk ---"
+    check_one "$WORKDIR/Bulk/relax" "Bulk/relax"
+    check_one "$WORKDIR/Bulk/statics" "Bulk/statics"
+
+    echo "--- Defects ---"
+    for defect_dir in "$WORKDIR"/Defect/Intrinsic/* "$WORKDIR"/Defect/Impurity/*; do
+        [ -d "$defect_dir" ] || continue
+        local dname=$(basename $defect_dir)
+        for q_dir in "$defect_dir"/q*; do
+            [ -d "$q_dir" ] || continue
+            local charge=$(basename $q_dir)
+            check_one "$q_dir/relax" "$dname/$charge/relax"
+            check_one "$q_dir/statics" "$dname/$charge/statics"
+        done
+    done
+    echo "=========================="
+}
+
+# ============ 主循环 ============
+
+log_msg "===== AUTO MONITOR STARTED ====="
+log_msg "WORKDIR: $WORKDIR"
+log_msg "CONFIG: $CONFIG"
+log_msg "Check interval: ${INTERVAL}s (10 min)"
+
+while true; do
+    # 按阶段依次检查，每个phase收敛后自动推进到下一个
+    phase4_check_completion && {
+        print_status
+        log_msg "===== MONITOR STOPPED: ALL COMPLETE ====="
+        exit 0
+    }
+
+    phase3_check_and_advance
+    phase2_check_and_advance
+    phase1_check_and_advance
+
+    # 打印当前状态
+    print_status >> $LOG
+
+    # 等待10分钟
+    sleep $INTERVAL
+done
+```
+
+#### 启动与停止
+
+```bash
+# 启动监控（后台运行，无AI审查）
+nohup bash auto_monitor.sh > monitor.out 2>&1 &
+echo $! > monitor.pid
+
+# 启动监控（后台运行，启用Claude AI审查）
+nohup bash auto_monitor.sh --claude > monitor.out 2>&1 &
+echo $! > monitor.pid
+
+echo "Monitor started, PID=$(cat monitor.pid)"
+
+# 查看实时输出
+tail -f monitor.out
+
+# 停止监控
+kill $(cat monitor.pid)
+```
+
+#### --claude 模式说明
+
+启用 `--claude` 后，每个阶段收敛时会自动调用 `claude -p` 审查计算结果：
+
+**审查内容：**
+- 能量收敛趋势（OSZICAR）：是否单调下降，有无震荡
+- 电子步收敛（OUTCAR）：每个离子步电子步数是否合理（<40步）
+- 原子力和应力：残余力是否<0.01 eV/Å
+- 磁矩：总磁矩是否符合缺陷类型预期
+- 结构变化：对比 POSCAR/CONTCAR，有无原子飞走或结构坍塌
+- Static特有：LOCPOT是否正常，EIGENVAL带边位置是否合理
+
+**审查结论：**
+- `PASS` — 无异常，自动推进到下一阶段
+- `WARNING` — 有潜在问题但不阻塞，记录后继续推进
+- `FAIL` — 严重问题，**暂停自动推进**，等待人工检查
+
+**审查结果保存在：** 各计算目录下的 `claude_review.txt`
+
+**注意：** `--claude` 需要 `claude` CLI 已安装且可用。每次审查会消耗API调用。
+
+#### 手动状态检查（可选）
+
+```bash
+#!/bin/bash
+# check_jobs.sh — 手动检查当前状态，不影响自动监控
+WORKDIR=$(pwd)
+echo "=== Defect Workflow Status ==="
+echo "Date: $(date)"
+check_dir() {
+    local dir=$1 label=$2
+    [ -d "$dir" ] || return
+    if grep -q "reached required accuracy" $dir/OUTCAR 2>/dev/null; then
+        local E=$(grep "energy  without entropy" $dir/OUTCAR | tail -1 | awk '{print $NF}')
+        echo "  CONVERGED  $label  (E=$E eV)"
+    elif grep -q "Error\|ZBRENT\|VERY BAD NEWS" $dir/vasp.out 2>/dev/null; then
+        echo "  ERROR      $label"
+    elif [ -f "$dir/OUTCAR" ]; then
+        local steps=$(grep -c "F=" $dir/OSZICAR 2>/dev/null || echo "?")
+        echo "  RUNNING    $label  (steps: $steps)"
+    elif [ -f "$dir/POSCAR" ]; then
+        echo "  READY      $label"
+    fi
+}
+echo "--- Bulk ---"
+check_dir "$WORKDIR/Bulk/relax" "Bulk/relax"
+check_dir "$WORKDIR/Bulk/statics" "Bulk/statics"
+echo "--- Defects ---"
+for d in "$WORKDIR"/Defect/Intrinsic/* "$WORKDIR"/Defect/Impurity/*; do
+    [ -d "$d" ] || continue
+    for q in "$d"/q*; do
+        [ -d "$q" ] || continue
+        check_dir "$q/relax" "$(basename $d)/$(basename $q)/relax"
+        check_dir "$q/statics" "$(basename $d)/$(basename $q)/statics"
+    done
+done
+```
+
+---
+
+## Quick Reference: VASP Parameters
+
+| Parameter | Bulk Relax | Defect Relax | Static |
+|-----------|-----------|-------------|--------|
+| ISIF | 3 | 2 | (none) |
+| IBRION | 2 | 2 | (none) |
+| NSW | 500 | 500 | (none, 0) |
+| LVHAR | - | - | .TRUE. |
+| ICORELEVEL | - | - | 1 |
+| ICHARG | - | - | 1 |
+| NELECT | (auto) | (auto for q0, set for q≠0) | (same as relax) |
+| ISPIN | 2 | 2 | 2 |
+| ISYM | (auto) | (auto) | (auto) |
+
+## References
+
+Read the detailed reference files for:
+- `references/chemical-potentials.md` — Stability region determination
+- `references/formation-energy-and-corrections.md` — Formation energy terms and FNV/Kumagai corrections
+- `references/formation-energy-diagram.md` — Plotting and thermodynamic analysis
+- `references/workflow-automation.md` — SLURM job scripts and monitoring
